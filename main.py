@@ -1,8 +1,4 @@
-from fastapi import FastAPI
+from gateway.app import create_app
+from gateway.config_loader import default_demo_config
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app(default_demo_config())
