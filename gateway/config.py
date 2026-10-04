@@ -37,6 +37,16 @@ class RouteRule:
     probe_path: str = "/health"
     probe_interval_seconds: float = 1.0
     probe_timeout_seconds: float = 1.0
+    # Gray (canary) release:
+    # Per-upstream traffic weights for this route. ``None`` (default) keeps
+    # the legacy lb_policy behaviour byte-for-byte; a mapping switches the
+    # route to deterministic weighted selection. Weight 0 = no new business
+    # traffic, but health probing/ejection bookkeeping continues.
+    weights: dict[str, int] | None = None
+    # Client stickiness TTL in seconds; 0 disables stickiness. When enabled,
+    # one client is pinned to one instance until the TTL expires, the target
+    # is ejected, or the target's weight drops to 0.
+    sticky_ttl_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -93,6 +103,20 @@ def demo_config() -> GatewayConfig:
             lb_policy=LBPolicy.LEAST_INFLIGHT,
             timeout_seconds=1.0,
             max_retries=0,
+            failure_threshold=3,
+            open_state_seconds=3.0,
+            probe_interval_seconds=0.2,
+            probe_path="/health",
+        ),
+        RouteRule(
+            id="echo-gray",
+            prefix="/v1/gray",
+            upstream_ids=("echo-a", "echo-b"),
+            # Gray release demo: 90/10 canary split, clients pinned for 30 s.
+            weights={"echo-a": 9, "echo-b": 1},
+            sticky_ttl_seconds=30.0,
+            timeout_seconds=1.0,
+            max_retries=1,
             failure_threshold=3,
             open_state_seconds=3.0,
             probe_interval_seconds=0.2,

@@ -17,16 +17,18 @@ uv run uvicorn main:app --port 8000
 ```bash
 curl -s localhost:8000/v1/echo/ping                 # 轮询 echo-a / echo-b
 curl -s localhost:8000/v1/load/x | head -c 200      # least-inflight 路由
+curl -s localhost:8000/v1/gray/x -H 'x-client-id: u1'  # 灰度路由：90/10 + 粘性
 curl -s localhost:8000/v1/flaky/x                   # 恒失败上游（观察摘除）
 curl -s localhost:8000/v1/slow/x                   # 恒超时上游（观察 504 + 熔断）
 curl -s localhost:8000/_gateway/health             # 上游健康/限流/LB 内部状态
+curl -s localhost:8000/_gateway/gray               # 灰度权重与实际流量分布
 curl -i localhost:8000/no-such-route               # 结构化 404
 ```
 
 运行测试：
 
 ```bash
-uv run pytest -q                # 全部 36 个用例
+uv run pytest -q                # 全部 53 个用例
 uv run pytest -s                # 同时打印每个请求的决策日志
 ```
 
@@ -37,7 +39,8 @@ Request
   └─ Router            前缀 + 方法匹配，第一条命中规则生效；未命中 -> ROUTE_NOT_FOUND
       └─ ClientLimiter 按客户端原子检查 固定窗口速率 与 并发占用
           └─ HealthRegistry.healthy_candidates   只返回未摘除（且半开名额未满）的实例
-              └─ LoadBalancer.acquire            在候选中按策略选一个并占 in-flight 槽
+              ├─ GrayController.select           灰度路由：按权重/粘性确定性地选实例
+              └─ LoadBalancer.acquire            非灰度路由：按 lb_policy 选一个并占 in-flight 槽
                   └─ Transport.send(timeout)     超时由传输层强制
                       └─ 结果回写 Health（连续失败摘除 / 成功复位）
               └─ 必要时按确定性规则重试（见下）
@@ -70,6 +73,60 @@ Request
 
 已摘除上游不出现在候选列表；半开（PROBING）上游仅在试探名额内出现；
 同一请求重试时已尝试过的上游通过 `exclude` 排除，不会重复选择。
+
+## 灰度发布：按权重分流与客户端粘性（`gateway/gray.py`）
+
+灰度能力是**纯增量**的：只有配置了 `weights` 或 `sticky_ttl_seconds > 0` 的路由
+才进入灰度模式；两者都没有的老路由走原有 `lb_policy`，行为与之前完全一致
+（`tests/test_gray.py::test_route_without_weights_keeps_legacy_round_robin` 有断言）。
+
+### 权重分流（`RouteRule.weights`）
+
+* `weights={"echo-a": 9, "echo-b": 1}`：同一条路由内按权重比例分配正常业务流量；
+  未配置权重的上游在该路由下按 0 处理。
+* **权重为 0 的实例不承接新业务流量**，但其熔断器与主动探测照常运行，
+  健康状态持续维护，可随时逐级放量（0 → 1 → N）或临时下线。
+* 无粘性时采用**平滑加权轮询**（smooth WRR）：分配结果确定、可复现——
+  相同权重表 + 相同请求序列得到完全相同的选中序列；每次选择的评分
+  （`wrr.scores_after`）写入决策日志，可逐条复核。
+* 全部权重为 0 时返回 `503 ALL_UPSTREAMS_UNAVAILABLE`，
+  `details.reason = "all_weights_zero"`，与熔断/无候选明确区分。
+
+### 客户端粘性（`RouteRule.sticky_ttl_seconds`）
+
+* 开启后，同一客户端（`X-Client-Id` / `X-Forwarded-For` 首跳）在 TTL 内
+  稳定命中同一实例；命中会滑动续期，保证灰度期间同一用户不来回跳版本。
+* 首次分配按 `sha256(route_id|client_id)` 落入权重区间，**确定且可复现**；
+  判定依据（`hash.bucket`、`hash.ranges`）全部入日志。
+* 重新分配的确定规则：TTL 到期、目标被摘除、或目标权重降为 0 时，
+  按同一哈希规则在**当前合格实例**（健康且权重 > 0）中重新分配；
+  绝不把请求发给已摘除实例。
+* 目标恢复后**不会**把该客户端立即切回：已建立的 pin 在 TTL 内继续有效，
+  避免恢复瞬间的流量回切抖动。
+* 所有 pin 的读写在同一把锁内原子完成：同一客户端并发请求只会落到一个实例，
+  调权切换瞬间也不会出现同一客户端被分到两个实例。
+
+### 运行时调权（不重启）
+
+```bash
+# 查看当前权重、实际承接分布、活跃粘性 pin 数
+curl -s localhost:8000/_gateway/gray
+
+# 调整某条路由的灰度权重，立即对新请求生效
+curl -s -XPOST localhost:8000/_gateway/gray/weights \
+  -H 'content-type: application/json' \
+  -d '{"route_id": "echo-gray", "weights": {"echo-a": 5, "echo-b": 5}}'
+```
+
+兼容范围与过渡规则：
+
+* 权重表整体原子替换；**正在处理中的请求不受影响**，新到请求按新权重走。
+* 已粘住的客户端：目标在新表中仍合格（权重 > 0 且健康）则保持不动，
+  实现平滑过渡；目标权重被调为 0 时按确定规则重新分配。
+* 调权校验：路由必须存在、上游必须属于该路由、权重必须为非负整数，
+  否则返回 400 且原权重表不变。
+* 对从未配置权重的老路由调用调权接口会将其切换为灰度模式；
+  不调用则行为永远不变。
 
 ## 健康与熔断参数（每条路由）
 
@@ -133,7 +190,7 @@ half_open_success_threshold - 1`（默认配置下恰好只有 1 次试探机会
 | `RATE_LIMITED` | 429 | 客户端超出窗口配额（附 `Retry-After`） |
 | `CONCURRENCY_LIMITED` | 503 | 客户端超出并发上限 |
 | `UPSTREAM_CIRCUIT_OPEN` | 503 | 发送前该路由所有上游断路器均处于 EJECTED（熔断真正打开） |
-| `ALL_UPSTREAMS_UNAVAILABLE` | 503 | 发送前无可用候选：路由无配置上游，或上游均处半开且试探名额已满（`details.reason` 区分） |
+| `ALL_UPSTREAMS_UNAVAILABLE` | 503 | 发送前无可用候选：路由无配置上游、上游均处半开且试探名额已满，或灰度路由全部权重为 0（`details.reason` 区分：`no_upstream_configured` / `half_open_capacity_exhausted` / `all_weights_zero`） |
 | `UPSTREAM_TIMEOUT` | 504 | 尝试真实发出但上游在 `timeout_seconds` 内未响应 |
 | `UPSTREAM_ERROR` | 502 | 连接错误或上游返回非 2xx/3xx（响应体附 `upstream_status`） |
 
@@ -146,8 +203,10 @@ half_open_success_threshold - 1`（默认配置下恰好只有 1 次试探机会
 网关对每个请求打印单行 `key=value` 决策日志到 stderr：
 
 * `#request`：方法、路径、客户端、命中规则、LB 策略与上游列表、限流判定快照；
-* `#attempt`：第几次尝试、选中上游、策略依据（counter/roll/inflight）、候选列表、
+* `#attempt`：第几次尝试、选中上游、策略依据（counter/roll/inflight；
+  灰度路由为 `weights`/`hash`/`sticky`/`wrr` 评分）、候选列表、
   结果（success/timeout/connect_error/upstream_error）、状态码、耗时与**全量上游健康快照**；
+* `#gray_weights_updated`：运行时调权后的新权重表与灰度快照；
 * `#retry_decision`：是否重试及判定依据（幂等性、剩余次数、上次原因）；
 * `#probe`：探测路由/上游/路径、成败、原因、耗时与健康快照；
 * `#gateway_error` / `#no_upstream` / `#rejected`：最终错误码与限流原因。
@@ -162,7 +221,21 @@ uv run pytest tests/test_health.py               # 连续失败摘除/确定性�
 uv run pytest tests/test_forwarder_gateway.py    # 超时熔断、重试副作用、错误码区分
 uv run pytest tests/test_recovery_integration.py # 摘除->探测恢复->重新接入闭环
 uv run pytest tests/test_http_app.py             # FastAPI 入口的状态码/响应体映射
+uv run pytest tests/test_gray.py                 # 权重分流/粘性/调权的单元级规则
+uv run pytest tests/test_gray_acceptance.py      # 真实起服务 + 并发请求观察分流比例与粘性
 uv run pytest -q                                 # 全量回归
+```
+
+灰度能力也可以手动验证（演示路由 `echo-gray`：90/10 权重 + 30 秒粘性）：
+
+```bash
+uv run uvicorn main:app --port 8000 &
+for i in $(seq 1 20); do curl -s localhost:8000/v1/gray/x -H "x-client-id: u$i"; echo; done
+curl -s localhost:8000/_gateway/gray             # 观察各实例实际承接分布与粘性 pin
+curl -s -XPOST localhost:8000/_gateway/gray/weights \
+  -H 'content-type: application/json' \
+  -d '{"route_id":"echo-gray","weights":{"echo-a":0,"echo-b":1}}'
+for i in $(seq 1 5); do curl -s localhost:8000/v1/gray/x -H "x-client-id: n$i"; echo; done
 ```
 
 也可以手动观察摘除与恢复：演示中的 `flaky`/`slow` 上游的 `/health` 恒为健康，
@@ -175,6 +248,7 @@ uv run pytest -q                                 # 全量回归
 | `gateway/config.py` | 配置模型（路由/上游/限流）与演示拓扑 |
 | `gateway/router.py` | 前缀+方法路由及匹配解释 |
 | `gateway/loadbalancer.py` | 三种 LB 策略与在飞计数（线程安全） |
+| `gateway/gray.py` | 灰度权重表、平滑加权轮询、客户端粘性 pin 与流量分布统计 |
 | `gateway/health.py` | 熔断状态机、候选准入、探测调度与回写 |
 | `gateway/ratelimiter.py` | 每客户端固定窗口限流 + 并发槽 |
 | `gateway/transport.py` | `HttpTransport`（httpx）与 `StubTransport`（进程内） |

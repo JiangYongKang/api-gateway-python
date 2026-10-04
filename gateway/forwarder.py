@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 
 from gateway.config import GatewayConfig, RouteRule
 from gateway.errors import ErrorCode, GatewayError
+from gateway.gray import GrayController
 from gateway.health import HealthRegistry
 from gateway.loadbalancer import LoadBalancer
 from gateway.logging_setup import decision_logger, log_event
@@ -60,11 +61,13 @@ class Forwarder:
         logger: logging.Logger | None = None,
         *,
         clock=time.monotonic,
+        gray: GrayController | None = None,
     ) -> None:
         self._config = config
         self._upstreams = {u.id: u for u in config.upstreams}
         self._health = health
         self._lb = lb
+        self._gray = gray
         self._transport = transport
         self._log = logger or decision_logger("forwarder")
         self._clock = clock
@@ -74,15 +77,25 @@ class Forwarder:
         tried: set[str] = set()
 
         max_attempts = 1 + max(0, rule.max_retries)
+        use_gray = self._gray is not None and self._gray.is_enabled(rule.id)
         for attempt_no in range(1, max_attempts + 1):
             candidates = self._health.healthy_candidates(rule)
-            selected, lb_explain = self._lb.acquire(
-                request, rule, candidates, exclude=frozenset(tried)
-            )
+            if use_gray:
+                # Weighted/sticky selection; legacy lb_policy untouched.
+                selected, lb_explain = self._gray.select(
+                    rule, request.client_id, candidates, exclude=frozenset(tried)
+                )
+            else:
+                selected, lb_explain = self._lb.acquire(
+                    request, rule, candidates, exclude=frozenset(tried)
+                )
             if selected is None:
                 if attempts:
                     break  # all candidates tried / ejected
-                reason, states = self._health.no_candidate_reason(rule)
+                if use_gray and lb_explain.get("reason") == "all_weights_zero":
+                    reason, states = "all_weights_zero", self._health.no_candidate_reason(rule)[1]
+                else:
+                    reason, states = self._health.no_candidate_reason(rule)
                 if reason == "all_circuits_open":
                     code = ErrorCode.UPSTREAM_CIRCUIT_OPEN
                     message = f"circuit open for every upstream of route '{rule.id}'"
@@ -133,6 +146,11 @@ class Forwarder:
                     self._log, "attempt",
                     rule=rule.id, attempt=attempt_no, upstream=selected,
                     policy=lb_explain.get("policy"),
+                    decision=lb_explain.get("reason"),
+                    weights=lb_explain.get("weights"),
+                    sticky=lb_explain.get("sticky"),
+                    hash=lb_explain.get("hash"),
+                    wrr=lb_explain.get("wrr"),
                     selected=selected, candidates=lb_explain.get("candidates"),
                     result="success" if ok else "upstream_error",
                     status=status, elapsed_ms=round(elapsed * 1000, 2),

@@ -30,7 +30,44 @@ def create_app(gateway: Gateway) -> FastAPI:
             "upstreams": gateway.health.snapshot(),
             "limiter": gateway.limiter.snapshot(),
             "lb": gateway.lb.snapshot(),
+            "gray": gateway.gray_snapshot(),
         }
+
+    @app.get("/_gateway/gray")
+    def gray_state() -> dict[str, Any]:
+        """Gray release state: weights, served distribution, sticky pins."""
+        return gateway.gray_snapshot()
+
+    @app.post("/_gateway/gray/weights")
+    async def gray_set_weights(request: FastRequest) -> FastResponse:
+        """Adjust one route's weights without a restart.
+
+        Body: ``{"route_id": "...", "weights": {"upstream-id": 90, ...}}``.
+        New requests follow the new table immediately; in-flight requests
+        and still-eligible sticky pins are unaffected.
+        """
+        try:
+            payload = json.loads(await request.body() or b"{}")
+        except json.JSONDecodeError:
+            payload = {}
+        route_id = payload.get("route_id", "")
+        weights = payload.get("weights")
+        if not isinstance(route_id, str) or not isinstance(weights, dict):
+            error = GatewayError(
+                ErrorCode.ROUTE_NOT_FOUND,
+                "body must be {\"route_id\": str, \"weights\": {upstream: int}}",
+                details={"reason": "invalid_body"},
+            )
+            return _to_http_response(_error_response(error, 400))
+        try:
+            result = gateway.set_route_weights(route_id, weights)
+        except GatewayError as exc:
+            return _to_http_response(_error_response(exc, 400))
+        return _to_http_response(GwResponse(
+            status=200,
+            headers={"content-type": "application/json"},
+            body=json.dumps(result, ensure_ascii=False).encode("utf-8"),
+        ))
 
     @app.get("/_gateway/routes/explain")
     async def routes_explain(request: FastRequest) -> dict[str, Any]:

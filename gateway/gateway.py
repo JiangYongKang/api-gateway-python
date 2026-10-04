@@ -15,6 +15,7 @@ from typing import Any
 from gateway.config import GatewayConfig
 from gateway.errors import ErrorCode, GatewayError
 from gateway.forwarder import Forwarder
+from gateway.gray import GrayController
 from gateway.health import HealthRegistry
 from gateway.loadbalancer import LoadBalancer
 from gateway.logging_setup import decision_logger, log_event
@@ -47,10 +48,13 @@ class Gateway:
         self.router = Router(config.routes)
         self.health = HealthRegistry(config.upstreams, clock=clock)
         self.lb = LoadBalancer()
+        self.gray = GrayController(clock=clock)
+        for rule in config.routes:
+            self.gray.configure_route(rule)
         self.limiter = ClientLimiter(config.rate, clock=clock)
         self._forwarder = Forwarder(
             config, self.health, self.lb, self._transport,
-            logger=self._log, clock=clock,
+            logger=self._log, clock=clock, gray=self.gray,
         )
         self._probe_stop = threading.Event()
         self._probe_thread: threading.Thread | None = None
@@ -149,6 +153,51 @@ class Gateway:
 
     def explain(self, request: Request) -> dict[str, Any]:
         return self.router.explain(request)
+
+    # -- gray (canary) weight management -----------------------------------
+    def set_route_weights(self, route_id: str, weights: dict[str, int]) -> dict[str, Any]:
+        """Adjust one route's gray weights at runtime (no restart).
+
+        New requests follow the new table immediately; in-flight requests
+        are untouched; pinned clients stay on their instance while it
+        remains eligible (weight > 0 and healthy).
+        """
+        rule = next((r for r in self._config.routes if r.id == route_id), None)
+        if rule is None:
+            raise GatewayError(
+                ErrorCode.ROUTE_NOT_FOUND,
+                f"no route with id '{route_id}'",
+                details={"reason": "unknown_route", "route_id": route_id},
+            )
+        unknown = sorted(set(weights) - set(rule.upstream_ids))
+        if unknown:
+            raise GatewayError(
+                ErrorCode.ROUTE_NOT_FOUND,
+                f"route '{route_id}' has no upstreams {unknown}",
+                details={
+                    "reason": "unknown_upstream",
+                    "route_id": route_id,
+                    "unknown": unknown,
+                    "known": list(rule.upstream_ids),
+                },
+            )
+        try:
+            self.gray.set_weights(route_id, weights)
+        except ValueError as exc:
+            raise GatewayError(
+                ErrorCode.ROUTE_NOT_FOUND,
+                str(exc),
+                details={"reason": "invalid_weight", "route_id": route_id},
+            ) from exc
+        current = self.gray.weights(route_id)
+        log_event(
+            self._log, "gray_weights_updated",
+            route=route_id, weights=current, gray=self.gray.snapshot(),
+        )
+        return {"route_id": route_id, "weights": current}
+
+    def gray_snapshot(self) -> dict[str, Any]:
+        return self.gray.snapshot()
 
     # -- probes -----------------------------------------------------------
     def _probe_loop(self, interval: float) -> None:
