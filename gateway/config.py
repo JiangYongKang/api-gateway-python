@@ -37,6 +37,9 @@ class RouteRule:
     probe_path: str = "/health"
     probe_interval_seconds: float = 1.0
     probe_timeout_seconds: float = 1.0
+    # Gray release (optional; None/absent keeps legacy behaviour exactly):
+    weights: dict[str, int] | None = None  # upstream_id -> weight; 0 = no new traffic
+    sticky_seconds: float = 0.0  # >0 pins a client to its assigned instance
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,7 @@ def demo_config() -> GatewayConfig:
         UpstreamConfig(id="echo-a", base_url="stub://echo-a"),
         UpstreamConfig(id="echo-b", base_url="stub://echo-b"),
         UpstreamConfig(id="echo-c", base_url="stub://echo-c"),
+        UpstreamConfig(id="echo-v2", base_url="stub://echo-v2"),
         UpstreamConfig(id="flaky", base_url="stub://flaky"),
         UpstreamConfig(id="slow", base_url="stub://slow"),
     )
@@ -79,6 +83,20 @@ def demo_config() -> GatewayConfig:
             prefix="/v1/echo",
             upstream_ids=("echo-a", "echo-b"),
             lb_policy=LBPolicy.ROUND_ROBIN,
+            timeout_seconds=1.0,
+            max_retries=1,
+            failure_threshold=3,
+            open_state_seconds=3.0,
+            probe_interval_seconds=0.2,
+            probe_path="/health",
+        ),
+        RouteRule(
+            id="gray-demo",
+            prefix="/v1/gray",
+            upstream_ids=("echo-a", "echo-v2"),
+            lb_policy=LBPolicy.ROUND_ROBIN,  # ignored once weights are set
+            weights={"echo-a": 9, "echo-v2": 1},  # 90% old / 10% canary
+            sticky_seconds=30.0,
             timeout_seconds=1.0,
             max_retries=1,
             failure_threshold=3,

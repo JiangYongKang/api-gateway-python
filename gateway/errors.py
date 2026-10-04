@@ -18,6 +18,7 @@ class ErrorCode(str, Enum):
     CONCURRENCY_LIMITED = "CONCURRENCY_LIMITED"
     UPSTREAM_TIMEOUT = "UPSTREAM_TIMEOUT"
     UPSTREAM_ERROR = "UPSTREAM_ERROR"
+    INVALID_WEIGHTS = "INVALID_WEIGHTS"
 
 
 # Deterministic HTTP status mapping (documented contract, see README).
@@ -29,6 +30,7 @@ HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.CONCURRENCY_LIMITED: 503,
     ErrorCode.UPSTREAM_TIMEOUT: 504,
     ErrorCode.UPSTREAM_ERROR: 502,
+    ErrorCode.INVALID_WEIGHTS: 400,
 }
 
 

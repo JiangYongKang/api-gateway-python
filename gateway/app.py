@@ -38,6 +38,45 @@ def create_app(gateway: Gateway) -> FastAPI:
         gw_request = _to_gateway_request(request, body)
         return gateway.explain(gw_request)
 
+    @app.get("/_gateway/weights")
+    def gray_state() -> dict[str, Any]:
+        """Gray-release introspection: weights, sticky pins, traffic split."""
+        return gateway.gray_snapshot()
+
+    @app.put("/_gateway/weights/{route_id}")
+    async def update_weights(route_id: str, request: FastRequest) -> FastResponse:
+        """Adjust one route's gray weights at runtime (no restart).
+
+        Body: ``{"upstream-id": non_negative_int, ...}``. Takes effect for
+        new requests immediately; in-flight requests and still-valid sticky
+        assignments are untouched.
+        """
+        try:
+            payload = json.loads(await request.body() or b"{}")
+        except json.JSONDecodeError as exc:
+            error = GatewayError(
+                ErrorCode.INVALID_WEIGHTS,
+                f"request body is not valid JSON: {exc}",
+                details={"reason": "invalid_json"},
+            )
+            return _to_http_response(_error_response(error))
+        if not isinstance(payload, dict) or not payload:
+            error = GatewayError(
+                ErrorCode.INVALID_WEIGHTS,
+                "body must be a non-empty object mapping upstream id to weight",
+                details={"reason": "invalid_payload"},
+            )
+            return _to_http_response(_error_response(error))
+        try:
+            change = gateway.set_route_weights(route_id, payload)
+        except GatewayError as exc:
+            return _to_http_response(_error_response(exc))
+        return _to_http_response(GwResponse(
+            status=200,
+            headers={"content-type": "application/json"},
+            body=json.dumps(change, ensure_ascii=False).encode("utf-8"),
+        ))
+
     @app.api_route(
         "/{path:path}",
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],

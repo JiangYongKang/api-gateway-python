@@ -66,6 +66,7 @@ def build_demo_gateway(config: GatewayConfig | None = None, *, start_probes: boo
         "echo-a": _route_handler(_make_echo("echo-a"), _make_health("echo-a")),
         "echo-b": _route_handler(_make_echo("echo-b"), _make_health("echo-b")),
         "echo-c": _route_handler(_make_echo("echo-c"), _make_health("echo-c")),
+        "echo-v2": _route_handler(_make_echo("echo-v2"), _make_health("echo-v2")),
         "flaky": _route_handler(
             _make_echo("flaky", fail=True), _make_health("flaky")
         ),

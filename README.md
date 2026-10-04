@@ -1,7 +1,8 @@
 # 本地 API 网关（Python / FastAPI）
 
 一个可完全本地运行的 API 网关层：按规则路由到多个上游、可配置且可解释的负载均衡、
-被动故障摘除 + 主动探测恢复、按客户端的限流与并发控制、超时/失败熔断，以及一组
+被动故障摘除 + 主动探测恢复、按客户端的限流与并发控制、超时/失败熔断、
+**按权重的灰度分流与客户端粘性**（可在线调权、可观察），以及一组
 **相互可区分**的错误码。所有外部依赖均可选——默认演示拓扑使用进程内 stub 上游，
 无需启动任何真实后端即可运行与验证。
 
@@ -21,12 +22,21 @@ curl -s localhost:8000/v1/flaky/x                   # 恒失败上游（观察�
 curl -s localhost:8000/v1/slow/x                   # 恒超时上游（观察 504 + 熔断）
 curl -s localhost:8000/_gateway/health             # 上游健康/限流/LB 内部状态
 curl -i localhost:8000/no-such-route               # 结构化 404
+
+# 灰度演示（/v1/gray：echo-a 90% / echo-v2 10%，客户端粘性 30s）
+for i in $(seq 1 20); do
+  curl -s -H "X-Client-Id: user-$i" localhost:8000/v1/gray/x | grep -o '"upstream":"[^"]*"'
+done | sort | uniq -c                               # 观察 ~9:1 分流
+curl -s localhost:8000/_gateway/weights            # 权重 / 粘性 / 实际流量分布
+curl -s -X PUT localhost:8000/_gateway/weights/gray-demo \
+  -H 'content-type: application/json' \
+  -d '{"echo-a": 1, "echo-v2": 1}'                 # 不重启调到 50:50，新请求立即生效
 ```
 
 运行测试：
 
 ```bash
-uv run pytest -q                # 全部 36 个用例
+uv run pytest -q                # 全部 74 个用例
 uv run pytest -s                # 同时打印每个请求的决策日志
 ```
 
@@ -38,6 +48,7 @@ Request
       └─ ClientLimiter 按客户端原子检查 固定窗口速率 与 并发占用
           └─ HealthRegistry.healthy_candidates   只返回未摘除（且半开名额未满）的实例
               └─ LoadBalancer.acquire            在候选中按策略选一个并占 in-flight 槽
+                                                 （配了权重的路由：粘性命中或加权哈希分桶）
                   └─ Transport.send(timeout)     超时由传输层强制
                       └─ 结果回写 Health（连续失败摘除 / 成功复位）
               └─ 必要时按确定性规则重试（见下）
@@ -70,6 +81,55 @@ Request
 
 已摘除上游不出现在候选列表；半开（PROBING）上游仅在试探名额内出现；
 同一请求重试时已尝试过的上游通过 `exclude` 排除，不会重复选择。
+
+## 灰度发布：按权重分流 + 客户端粘性
+
+同一条路由可以为每个实例配置权重（`RouteRule.weights`），把新老版本按比例放量；
+`sticky_seconds > 0` 时同一客户端在 TTL 内稳定命中同一实例，避免灰度期间
+用户在两个版本间来回跳。**没配 `weights` 的路由完全走原有 LB 策略路径，
+行为与灰度功能引入前逐字节一致。**
+
+### 权重规则（`gateway/weights.py: WeightManager`）
+
+* 路由一旦配置权重，选择切换为**确定性哈希分桶**：
+  `bucket = sha256(route_id::client_id) mod 总权重`，按配置顺序把
+  `[0, 总权重)` 切成各实例的累计区间，bucket 落在谁的区间就选谁。
+  同一客户端在权重与候选集不变时**永远**落到同一实例，可复现、可手工复核
+  （日志记录 `hash`/`bucket`/`ranges`/各实例权重与版本号）。
+* 权重为 0（或权重表中缺失）的实例**不承接新业务流量**，但健康维护
+  （失败摘除、主动探测、半开恢复）照常运行——临时下线和逐级放量都靠它。
+* 所有实例权重均为 0 时按无候选处理（`ALL_UPSTREAMS_UNAVAILABLE`），
+  绝不把请求发给权重为 0 的实例。
+* 权重只接受非负整数；非法值返回 `400 INVALID_WEIGHTS`。
+
+### 粘性规则（`gateway/weights.py: StickyAssigner`）
+
+* 首次（或重新分配）时按上面的加权哈希选定实例，之后**滑动 TTL** 内
+  同一客户端复用该实例；活跃用户的粘性随访问续期。
+* 出现以下任一情况时按确定规则**重新分配**（仍走加权哈希）：
+  粘性到期、目标实例被摘除、目标权重被调为 0。
+  重新分配只在健康且权重 > 0 的候选中进行，**绝不落到已摘除实例**。
+* 目标实例恢复后**不会**把客户端立刻切回去：客户端继续留在当前实例直到
+  粘性自然到期，避免恢复瞬间的流量回切抖动。
+* 查找 + 校验 + 重新分配在**同一把锁**内原子完成：同一客户端并发打进来的
+  多个请求只会得到一个分配结果，不会同时被分到两个实例。
+
+### 在线调权与可观察性
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET /_gateway/weights` | 每条路由当前权重（含版本号）、存活粘性分配、各实例实际承接的请求数 |
+| `PUT /_gateway/weights/{route_id}` | 不重启调整权重，body 如 `{"echo-a": 1, "echo-v2": 1}` |
+
+调权语义：新到的请求立即按新权重走；**在处理中的请求**已完成实例选择，
+不受影响；**已粘住的客户端**在其粘性仍有效（未到期、目标健康且权重 > 0）
+时保持不动，失效时按新权重确定性地重新分配——切换瞬间同一客户端
+不会被分到多个实例。路由不存在返回 `404 ROUTE_NOT_FOUND`，权重里出现
+路由外的上游或非法值返回 `400 INVALID_WEIGHTS`，写错名字不会静默生效。
+
+兼容范围：调权只接受该路由 `upstream_ids` 内的实例；权重表是路由级的，
+运行时调整只影响本进程内存（重启后回到静态配置）；未在权重表中列出的
+实例按权重 0 处理（显式 opt-in）。
 
 ## 健康与熔断参数（每条路由）
 
@@ -136,6 +196,7 @@ half_open_success_threshold - 1`（默认配置下恰好只有 1 次试探机会
 | `ALL_UPSTREAMS_UNAVAILABLE` | 503 | 发送前无可用候选：路由无配置上游，或上游均处半开且试探名额已满（`details.reason` 区分） |
 | `UPSTREAM_TIMEOUT` | 504 | 尝试真实发出但上游在 `timeout_seconds` 内未响应 |
 | `UPSTREAM_ERROR` | 502 | 连接错误或上游返回非 2xx/3xx（响应体附 `upstream_status`） |
+| `INVALID_WEIGHTS` | 400 | 灰度调权请求非法：权重为负/非整数、上游不属于该路由、body 非 JSON |
 
 关键边界：把断路器推过阈值的**那一次请求**已真实到达上游，返回它自己的结果
 （504/502）；只有其后的请求在“发送前”就无候选可用时才得到
@@ -146,10 +207,12 @@ half_open_success_threshold - 1`（默认配置下恰好只有 1 次试探机会
 网关对每个请求打印单行 `key=value` 决策日志到 stderr：
 
 * `#request`：方法、路径、客户端、命中规则、LB 策略与上游列表、限流判定快照；
-* `#attempt`：第几次尝试、选中上游、策略依据（counter/roll/inflight）、候选列表、
-  结果（success/timeout/connect_error/upstream_error）、状态码、耗时与**全量上游健康快照**；
+* `#attempt`：第几次尝试、选中上游、策略依据（counter/roll/inflight；
+  灰度路由额外带 `bucket`/`hash`/`ranges`/权重版本与 `sticky=hit|new|expired|target_ineligible`）、
+  候选列表、结果（success/timeout/connect_error/upstream_error）、状态码、耗时与**全量上游健康快照**；
 * `#retry_decision`：是否重试及判定依据（幂等性、剩余次数、上次原因）；
 * `#probe`：探测路由/上游/路径、成败、原因、耗时与健康快照；
+* `#weights_updated`：在线调权前后的权重表、总权重与版本号；
 * `#gateway_error` / `#no_upstream` / `#rejected`：最终错误码与限流原因。
 
 用 `uv run pytest -s` 可在测试输出中直接看到这些日志。
@@ -162,8 +225,18 @@ uv run pytest tests/test_health.py               # 连续失败摘除/确定性�
 uv run pytest tests/test_forwarder_gateway.py    # 超时熔断、重试副作用、错误码区分
 uv run pytest tests/test_recovery_integration.py # 摘除->探测恢复->重新接入闭环
 uv run pytest tests/test_http_app.py             # FastAPI 入口的状态码/响应体映射
+uv run pytest tests/test_weights.py              # 权重分桶确定性/比例/零权重 + 粘性 TTL/并发原子性
+uv run pytest tests/test_grayrelease.py          # 灰度分流、摘除/调零重分配、恢复不回切（伪时钟）
+uv run pytest tests/test_gray_admin.py           # 在线查/调权重端点与非法请求的错误码
+uv run pytest tests/test_gray_acceptance.py -s   # 真起 uvicorn + 并发打流，观察实际分流比与粘性
 uv run pytest -q                                 # 全量回归
 ```
+
+灰度能力的端到端观察（`tests/test_gray_acceptance.py` 会把每个场景的判定依据、
+权重与上游健康状态打进日志，`-s` 可见）：真实 uvicorn 服务下，400 个并发客户端
+的实际分流比落在权重 ±7% 内；同一热客户端 16 线程并发 64 请求全部命中同一实例；
+`PUT /_gateway/weights/gray` 调权后新流量立即按新权重走且权重 0 的实例
+健康跟踪不中断。
 
 也可以手动观察摘除与恢复：演示中的 `flaky`/`slow` 上游的 `/health` 恒为健康，
 持续请求 `/v1/flaky/x` 可先看到 502、随后 503（摘除），约 2 秒后探测成功自动恢复。
@@ -172,9 +245,10 @@ uv run pytest -q                                 # 全量回归
 
 | 文件 | 职责 |
 | --- | --- |
-| `gateway/config.py` | 配置模型（路由/上游/限流）与演示拓扑 |
+| `gateway/config.py` | 配置模型（路由/上游/限流/灰度权重与粘性）与演示拓扑 |
 | `gateway/router.py` | 前缀+方法路由及匹配解释 |
-| `gateway/loadbalancer.py` | 三种 LB 策略与在飞计数（线程安全） |
+| `gateway/loadbalancer.py` | 三种 LB 策略、灰度加权/粘性选择、在飞与流量计数（线程安全） |
+| `gateway/weights.py` | 灰度权重表（确定性哈希分桶、在线调权）与粘性分配器（滑动 TTL、原子分配） |
 | `gateway/health.py` | 熔断状态机、候选准入、探测调度与回写 |
 | `gateway/ratelimiter.py` | 每客户端固定窗口限流 + 并发槽 |
 | `gateway/transport.py` | `HttpTransport`（httpx）与 `StubTransport`（进程内） |

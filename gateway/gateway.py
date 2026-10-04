@@ -27,6 +27,7 @@ from gateway.transport import (
     TransportTimeout,
     UpstreamTransportProto,
 )
+from gateway.weights import StickyAssigner, WeightManager
 
 
 class Gateway:
@@ -46,7 +47,14 @@ class Gateway:
 
         self.router = Router(config.routes)
         self.health = HealthRegistry(config.upstreams, clock=clock)
-        self.lb = LoadBalancer()
+        # Gray release: weights seeded from static route config, adjustable
+        # at runtime via set_route_weights(); stickiness is in-memory only.
+        self.weights = WeightManager(
+            {r.id: dict(r.weights) for r in config.routes if r.weights},
+            clock=clock,
+        )
+        self.sticky = StickyAssigner(clock=clock)
+        self.lb = LoadBalancer(weights=self.weights, sticky=self.sticky)
         self.limiter = ClientLimiter(config.rate, clock=clock)
         self._forwarder = Forwarder(
             config, self.health, self.lb, self._transport,
@@ -149,6 +157,59 @@ class Gateway:
 
     def explain(self, request: Request) -> dict[str, Any]:
         return self.router.explain(request)
+
+    # -- gray release -----------------------------------------------------
+    def set_route_weights(self, route_id: str, weights: dict[str, int]) -> dict[str, Any]:
+        """Adjust a route's gray weights without restarting.
+
+        Only upstreams of the named route may appear; unknown routes or
+        upstreams are rejected so a typo can never silently create a
+        stray weight table. New requests follow the new weights
+        immediately; in-flight requests and still-valid sticky
+        assignments are unaffected.
+        """
+        rule = next((r for r in self._config.routes if r.id == route_id), None)
+        if rule is None:
+            raise GatewayError(
+                ErrorCode.ROUTE_NOT_FOUND,
+                f"no route with id '{route_id}'",
+                details={"reason": "unknown_route", "route_id": route_id},
+            )
+        unknown = sorted(set(weights) - set(rule.upstream_ids))
+        if unknown:
+            raise GatewayError(
+                ErrorCode.INVALID_WEIGHTS,
+                f"route '{route_id}' has no upstreams {unknown}",
+                details={
+                    "reason": "unknown_upstream",
+                    "route_id": route_id,
+                    "unknown": unknown,
+                    "known": list(rule.upstream_ids),
+                },
+            )
+        try:
+            change = self.weights.set_weights(route_id, weights)
+        except ValueError as exc:
+            raise GatewayError(
+                ErrorCode.INVALID_WEIGHTS,
+                str(exc),
+                details={"reason": "invalid_weights", "route_id": route_id},
+            ) from exc
+        log_event(
+            self._log, "weights_updated",
+            route=route_id, previous=change["previous"],
+            weights=change["weights"], total_weight=change["total_weight"],
+            version=change["version"],
+        )
+        return change
+
+    def gray_snapshot(self) -> dict[str, Any]:
+        """Weights, live sticky assignments and observed traffic split."""
+        return {
+            "weights": self.weights.snapshot(),
+            "sticky": self.sticky.snapshot(),
+            "traffic": self.lb.snapshot()["traffic"],
+        }
 
     # -- probes -----------------------------------------------------------
     def _probe_loop(self, interval: float) -> None:

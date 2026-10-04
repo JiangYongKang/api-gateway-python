@@ -7,6 +7,7 @@ from typing import Any
 
 from gateway.config import LBPolicy, RouteRule
 from gateway.models import Request
+from gateway.weights import StickyAssigner, WeightManager
 
 
 class LoadBalancer:
@@ -20,16 +21,34 @@ class LoadBalancer:
       * ``least_inflight`` – candidate with the fewest in-flight requests;
                              ties broken by configuration order.
 
-    State is keyed per route and guarded by one lock. Active health probes
-    never call ``acquire``/``release`` and therefore never touch the
-    in-flight counters.
+    Gray release (only when the route has weights configured):
+      * candidates with weight 0 never receive new business traffic;
+      * selection is a deterministic hash-bucket pick over the weights
+        (see :class:`gateway.weights.WeightManager`);
+      * when ``rule.sticky_seconds > 0`` a client is pinned to its
+        assigned instance for a sliding TTL (see
+        :class:`gateway.weights.StickyAssigner`).
+
+    Routes without weights take the legacy policy path above, byte for
+    byte. State is keyed per route and guarded by one lock. Active health
+    probes never call ``acquire``/``release`` and therefore never touch
+    the in-flight counters.
     """
 
-    def __init__(self, rng: random.Random | None = None) -> None:
+    def __init__(
+        self,
+        rng: random.Random | None = None,
+        *,
+        weights: WeightManager | None = None,
+        sticky: StickyAssigner | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._rr_counter: dict[str, int] = {}
         self._inflight: dict[tuple[str, str], int] = {}
+        self._traffic: dict[tuple[str, str], int] = {}
         self._rng = rng or random.Random()
+        self._weights = weights
+        self._sticky = sticky
 
     def acquire(
         self,
@@ -37,6 +56,19 @@ class LoadBalancer:
         rule: RouteRule,
         candidates: list[str],
         exclude: frozenset[str] = frozenset(),
+    ) -> tuple[str | None, dict[str, Any]]:
+        weights = self._weights.weights_for(rule.id) if self._weights else None
+        if weights is None:
+            return self._acquire_legacy(request, rule, candidates, exclude)
+        return self._acquire_weighted(request, rule, candidates, exclude, weights)
+
+    # -- legacy path (routes without weights: behaviour unchanged) -------
+    def _acquire_legacy(
+        self,
+        request: Request,
+        rule: RouteRule,
+        candidates: list[str],
+        exclude: frozenset[str],
     ) -> tuple[str | None, dict[str, Any]]:
         with self._lock:
             ordered = [u for u in candidates if u not in exclude]
@@ -77,14 +109,69 @@ class LoadBalancer:
                     "selected_count": counts[selected],
                 }
 
-            key = (rule.id, selected)
-            self._inflight[key] = self._inflight.get(key, 0) + 1
+            self._account_locked(rule.id, selected)
             explain.update({
                 "candidates": ordered,
                 "excluded": sorted(exclude),
                 "selected": selected,
             })
             return selected, explain
+
+    # -- gray-release path (route has weights configured) ----------------
+    def _acquire_weighted(
+        self,
+        request: Request,
+        rule: RouteRule,
+        candidates: list[str],
+        exclude: frozenset[str],
+        weights: dict[str, int],
+    ) -> tuple[str | None, dict[str, Any]]:
+        assert self._weights is not None
+        # Weight 0 (or missing entry) drains the instance: no new traffic,
+        # while health maintenance keeps running elsewhere. ``exclude``
+        # (already-tried upstreams of this request) is honoured as usual.
+        eligible = [
+            u for u in candidates if u not in exclude and weights.get(u, 0) > 0
+        ]
+        base_explain: dict[str, Any] = {
+            "gray": True,
+            "policy": "weighted",
+            "candidates": candidates,
+            "excluded": sorted(exclude),
+            "eligible": eligible,
+        }
+        if not eligible:
+            return None, {
+                **base_explain,
+                "weights": {u: weights.get(u, 0) for u in candidates},
+                "selected": None,
+                "reason": "all_weights_zero",
+            }
+
+        if rule.sticky_seconds > 0 and self._sticky is not None:
+            eligible_set = frozenset(eligible)
+            selected, explain = self._sticky.lookup_or_assign(
+                rule.id,
+                request.client_id,
+                rule.sticky_seconds,
+                is_valid=lambda u: u in eligible_set,
+                choose=lambda: self._weights.pick(rule.id, request.client_id, eligible),
+            )
+        else:
+            selected, explain = self._weights.pick(rule.id, request.client_id, eligible)
+        explain = {**base_explain, **explain}
+        if selected is None:
+            return None, explain
+
+        with self._lock:
+            self._account_locked(rule.id, selected)
+        return selected, explain
+
+    # -- shared accounting -------------------------------------------------
+    def _account_locked(self, rule_id: str, upstream_id: str) -> None:
+        key = (rule_id, upstream_id)
+        self._inflight[key] = self._inflight.get(key, 0) + 1
+        self._traffic[key] = self._traffic.get(key, 0) + 1
 
     def release(self, rule_id: str, upstream_id: str) -> None:
         with self._lock:
@@ -102,4 +189,5 @@ class LoadBalancer:
             return {
                 "rr_counters": dict(self._rr_counter),
                 "inflight": {f"{rule_id}:{upstream_id}": n for (rule_id, upstream_id), n in self._inflight.items()},
+                "traffic": {f"{rule_id}:{upstream_id}": n for (rule_id, upstream_id), n in self._traffic.items()},
             }
